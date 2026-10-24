@@ -1,0 +1,768 @@
+import random
+import math
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import odeint
+
+# Set to True to use the literal sign "+2*gamma_h*[I_hI_h]" from the supplied
+# equations; set to False to use the epidemiologically standard "-2*gamma_h".
+# ([I_hI_h] does not feed back into any other equation, so this only affects
+#  that variable -- but the literal "+" makes it grow exponentially and can
+#  slow the integrator.)
+LITERAL_II_HH_SIGN = True
+
+
+# ===================================================================
+# 1. NETWORK GENERATION (Bimodal + Mixed)
+# ===================================================================
+
+def generate_mixed_network(N_h, N_r, d_h1, d_h2, frac_h1, d_r1, d_r2, frac_r1, p_hh, p_hr, p_rr):
+    h_degrees = []
+    N_h1 = int(frac_h1 * N_h)
+    N_h2 = N_h - N_h1
+    h_degrees.extend([d_h1] * N_h1)
+    h_degrees.extend([d_h2] * N_h2)
+    random.shuffle(h_degrees)
+
+    r_degrees = []
+    N_r1 = int(frac_r1 * N_r)
+    N_r2 = N_r - N_r1
+    r_degrees.extend([d_r1] * N_r1)
+    r_degrees.extend([d_r2] * N_r2)
+    random.shuffle(r_degrees)
+
+    h_stubs = []
+    for i, deg in enumerate(h_degrees):
+        h_stubs.extend([('H', i)] * deg)
+    r_stubs = []
+    for i, deg in enumerate(r_degrees):
+        r_stubs.extend([('R', i)] * deg)
+
+    total_h_stubs = len(h_stubs)
+    total_r_stubs = len(r_stubs)
+
+    random.shuffle(h_stubs)
+    random.shuffle(r_stubs)
+
+    n_cross = int(p_hr * total_h_stubs / 2)
+    n_cross = min(n_cross, total_r_stubs // 2)
+
+    n_hh = int(p_hh * total_h_stubs / 2)
+    n_rr = int(p_rr * total_r_stubs / 2)
+
+    n_hh = min(n_hh, (total_h_stubs - 2 * n_cross) // 2)
+    n_rr = min(n_rr, (total_r_stubs - 2 * n_cross) // 2)
+
+    N = N_h + N_r
+    adj = [[] for _ in range(N)]
+    species = ['H'] * N_h + ['R'] * N_r
+
+    def h_global(i): return i
+    def r_global(j): return N_h + j
+
+    used_h_stubs = set()
+    used_r_stubs = set()
+    cross_edges = []
+    for _ in range(n_cross):
+        h_idx = random.randint(0, len(h_stubs) - 1)
+        while h_idx in used_h_stubs:
+            h_idx = random.randint(0, len(h_stubs) - 1)
+        used_h_stubs.add(h_idx)
+
+        r_idx = random.randint(0, len(r_stubs) - 1)
+        while r_idx in used_r_stubs:
+            r_idx = random.randint(0, len(r_stubs) - 1)
+        used_r_stubs.add(r_idx)
+
+        h_node = h_stubs[h_idx][1]
+        r_node = r_stubs[r_idx][1]
+        cross_edges.append((h_global(h_node), r_global(r_node)))
+
+    hh_edges = []
+    h_stubs_available = [i for i in range(len(h_stubs)) if i not in used_h_stubs]
+    for _ in range(n_hh):
+        if len(h_stubs_available) < 2:
+            break
+        idx1 = random.choice(h_stubs_available)
+        h_stubs_available.remove(idx1)
+        idx2 = random.choice(h_stubs_available)
+        h_stubs_available.remove(idx2)
+        hh_edges.append((h_global(h_stubs[idx1][1]), h_global(h_stubs[idx2][1])))
+
+    rr_edges = []
+    r_stubs_available = [i for i in range(len(r_stubs)) if i not in used_r_stubs]
+    for _ in range(n_rr):
+        if len(r_stubs_available) < 2:
+            break
+        idx1 = random.choice(r_stubs_available)
+        r_stubs_available.remove(idx1)
+        idx2 = random.choice(r_stubs_available)
+        r_stubs_available.remove(idx2)
+        rr_edges.append((r_global(r_stubs[idx1][1]), r_global(r_stubs[idx2][1])))
+
+    for u, v in cross_edges + hh_edges + rr_edges:
+        adj[u].append(v)
+        adj[v].append(u)
+
+    return adj, species, N_h, N_r
+
+
+def network_edge_summary(adj, species, N_h, N_r):
+    """Count actual hh / hr / rr edges and average degree by type."""
+    edges_hh = edges_hr = edges_rr = 0
+    deg_h_total = deg_r_total = 0
+    N = N_h + N_r
+    for u in range(N):
+        deg_u = len(adj[u])
+        if species[u] == 'H':
+            deg_h_total += deg_u
+        else:
+            deg_r_total += deg_u
+        for v in adj[u]:
+            if v > u:
+                if species[u] == 'H' and species[v] == 'H':
+                    edges_hh += 1
+                elif species[u] == 'R' and species[v] == 'R':
+                    edges_rr += 1
+                else:
+                    edges_hr += 1
+    kh = deg_h_total / N_h if N_h > 0 else 0
+    kr = deg_r_total / N_r if N_r > 0 else 0
+    return edges_hh, edges_hr, edges_rr, kh, kr
+
+
+# ===================================================================
+# 2. STOCHASTIC SIMULATION
+# ===================================================================
+
+def simulate_two_species(adj, species, N_h, N_r,
+                         alpha_rh, alpha_h, tau_h, q, gamma_h,
+                         tau_rr, gamma_r,
+                         init_frac_h, init_frac_r, t_max):
+    N = N_h + N_r
+    human_nodes = [i for i in range(N) if species[i] == 'H']
+    rodent_nodes = [i for i in range(N) if species[i] == 'R']
+    h_index = {node: i for i, node in enumerate(human_nodes)}
+    r_index = {node: i for i, node in enumerate(rodent_nodes)}
+
+    h_status = [0] * N_h
+    r_status = [0] * N_r
+
+    for idx in random.sample(range(N_h), int(init_frac_h * N_h)):
+        h_status[idx] = 2
+    for idx in random.sample(range(N_r), int(init_frac_r * N_r)):
+        r_status[idx] = 1
+
+    h_I_list = [i for i in range(N_h) if h_status[i] == 2]
+    h_E_list = [i for i in range(N_h) if h_status[i] == 1]
+    h_Q_list = [i for i in range(N_h) if h_status[i] == 3]
+    r_I_list = [i for i in range(N_r) if r_status[i] == 1]
+
+    t = 0.0
+
+    def snap():
+        return (t, len(h_I_list), len(h_E_list), len(h_Q_list),
+                sum(1 for s in h_status if s == 4),
+                len(r_I_list),
+                sum(1 for s in r_status if s == 2))
+
+    history = [snap()]
+
+    while t < t_max:
+        rr_SI_edges = []
+        for r in r_I_list:
+            for nb in adj[rodent_nodes[r]]:
+                if species[nb] == 'R':
+                    nb_r = r_index[nb]
+                    if r_status[nb_r] == 0:
+                        rr_SI_edges.append((r, nb_r))
+        T_rr = tau_rr * len(rr_SI_edges)
+
+        R_r = gamma_r * len(r_I_list)
+
+        zoonotic_edges = []
+        for r in r_I_list:
+            for nb in adj[rodent_nodes[r]]:
+                if species[nb] == 'H':
+                    h_idx = h_index[nb]
+                    if h_status[h_idx] == 0:
+                        zoonotic_edges.append((h_idx, r))
+        Z = alpha_rh * len(zoonotic_edges)
+
+        hh_SI_edges = []
+        for h in h_I_list:
+            for nb in adj[human_nodes[h]]:
+                if species[nb] == 'H':
+                    nb_h = h_index[nb]
+                    if h_status[nb_h] == 0:
+                        hh_SI_edges.append((h, nb_h))
+        H = alpha_h * len(hh_SI_edges)
+
+        E_prog = tau_h * len(h_E_list)
+        E_quar = q * len(h_E_list)
+        I_rec = gamma_h * len(h_I_list)
+        Q_rec = gamma_h * len(h_Q_list)
+
+        R_total = T_rr + R_r + Z + H + E_prog + E_quar + I_rec + Q_rec
+        if R_total == 0:
+            break
+
+        t += -math.log(random.random()) / R_total
+        u = random.random()
+        cumulative = 0.0
+
+        cumulative += T_rr / R_total
+        if u < cumulative:
+            r_sus = random.choice(rr_SI_edges)[1]
+            r_status[r_sus] = 1
+            r_I_list.append(r_sus)
+            history.append(snap()); continue
+
+        cumulative += R_r / R_total
+        if u < cumulative:
+            r_rec = random.choice(r_I_list)
+            r_status[r_rec] = 2
+            r_I_list.remove(r_rec)
+            history.append(snap()); continue
+
+        cumulative += Z / R_total
+        if u < cumulative:
+            h_sus = random.choice(zoonotic_edges)[0]
+            h_status[h_sus] = 1
+            h_E_list.append(h_sus)
+            history.append(snap()); continue
+
+        cumulative += H / R_total
+        if u < cumulative:
+            h_sus = random.choice(hh_SI_edges)[1]
+            h_status[h_sus] = 1
+            h_E_list.append(h_sus)
+            history.append(snap()); continue
+
+        cumulative += E_prog / R_total
+        if u < cumulative:
+            h = random.choice(h_E_list)
+            h_status[h] = 2
+            h_E_list.remove(h); h_I_list.append(h)
+            history.append(snap()); continue
+
+        cumulative += E_quar / R_total
+        if u < cumulative:
+            h = random.choice(h_E_list)
+            h_status[h] = 3
+            h_E_list.remove(h); h_Q_list.append(h)
+            history.append(snap()); continue
+
+        cumulative += I_rec / R_total
+        if u < cumulative:
+            h = random.choice(h_I_list)
+            h_status[h] = 4
+            h_I_list.remove(h)
+            history.append(snap()); continue
+
+        cumulative += Q_rec / R_total
+        if u < cumulative:
+            h = random.choice(h_Q_list)
+            h_status[h] = 4
+            h_Q_list.remove(h)
+            history.append(snap()); continue
+
+    return history
+
+
+# ===================================================================
+# 3a. MEAN-FIELD (SINGLES) ODE MODEL
+# ===================================================================
+
+def mean_field_singles_odes(y, t, params):
+    (N_h, N_r, kh, kr,
+     alpha_rh, alpha_h, tau_h, q, gamma_h, tau_rr, gamma_r,
+     delta_hh, delta_rh) = params
+
+    S_h, E_h, I_h, Q_h, R_h, S_r, I_r, R_r = y
+
+    pi_Ih = I_h / N_h
+    pi_Ir = I_r / N_r
+
+    SI_hr_mf = delta_rh * kh * S_h * pi_Ir
+    SI_hh_mf = delta_hh * kh * S_h * pi_Ih
+    SI_rr_mf = kr * S_r * pi_Ir
+
+    dS_h = -alpha_rh * SI_hr_mf - alpha_h * SI_hh_mf
+    dE_h = alpha_rh * SI_hr_mf + alpha_h * SI_hh_mf - (tau_h + q) * E_h
+    dI_h = tau_h * E_h - gamma_h * I_h
+    dQ_h = q * E_h - gamma_h * Q_h
+    dR_h = gamma_h * (I_h + Q_h)
+
+    dS_r = -tau_rr * SI_rr_mf
+    dI_r = tau_rr * SI_rr_mf - gamma_r * I_r
+    dR_r = gamma_r * I_r
+
+    return [dS_h, dE_h, dI_h, dQ_h, dR_h, dS_r, dI_r, dR_r]
+
+
+# ===================================================================
+# 3b. PAIRWISE CLUSTERED-APPROXIMATION ODE MODEL
+# ===================================================================
+
+def pairwise_clustered_odes(y, t, params):
+    (N_h, N_r, kh, kr,
+     alpha_rh, alpha_h, tau_h, q, gamma_h, tau_rr, gamma_r,
+     phi, delta_hh, delta_rh, delta_rr) = params
+
+    (SS_hh, SE_hh, SI_hh, EE_hh, EI_hh, II_hh,
+     SS_hr, SI_hr,
+     SS_rr, SI_rr, II_rr,
+     S_h, E_h, I_h, Q_h, R_h,
+     S_r, I_r, R_r) = y
+
+    I_h_safe = max(I_h, 1e-9)
+    I_r_safe = max(I_r, 1e-9)
+
+    pi_Ih = I_h / N_h
+    pi_Ir = I_r / N_r
+
+    # Cluster-normalisation scales (k = l = kh, x = y = kr)
+    n_hh_Nh_over_m = N_h / kh                              # n_h*N_h/(k*l)
+    n_rr_Nr_over_z = N_r / kr                              # n_r*N_r/(x*y)
+    n_rh_over_kx = (kh * N_h + kr * N_r) / (kh * kr)     # n_rh*N/(k*x)
+
+    def bracket_hh(deg):
+        return ((1 - phi) * delta_hh * deg * pi_Ih
+                + phi * n_hh_Nh_over_m * (delta_hh ** 2) * (pi_Ih ** 2) * deg / I_h_safe)
+
+    def bracket_rh_h(deg):
+        return ((1 - phi) * delta_rh * deg * pi_Ir
+                + phi * n_rh_over_kx * delta_rh * delta_rr * (pi_Ir ** 2) * deg / I_r_safe)
+
+    def bracket_rh_r(deg):
+        return ((1 - phi) * delta_rr * deg * pi_Ir
+                + phi * n_rh_over_kx * delta_rh * delta_rr * (pi_Ir ** 2) * deg / I_r_safe)
+
+    def bracket_rr(deg):
+        return ((1 - phi) * delta_rr * deg * pi_Ir
+                + phi * n_rr_Nr_over_z * (delta_rr ** 2) * (pi_Ir ** 2) * deg / I_r_safe)
+
+    B_hh = bracket_hh(kh)
+    B_rh_h = bracket_rh_h(kh)
+    B_rh_r = bracket_rh_r(kr)
+    B_rr = bracket_rr(kr)
+
+    # ---- Human-human pairs ----
+    dSS_hh = -2 * alpha_rh * (kh - 1) * B_rh_h * SS_hh
+
+    dSE_hh = (alpha_rh * (kh - 1) / kh * SS_hh * B_rh_h
+              + alpha_h * (kh - 1) / kh * SS_hh * B_hh
+              - alpha_h * (kh - 1) / kh * SE_hh * B_hh
+              - tau_h * SE_hh - q * SE_hh)
+
+    dSI_hh = tau_h * SE_hh - (alpha_h + gamma_h) * SI_hh
+
+    dEE_hh = 2 * alpha_h * (kh - 1) / kh * SE_hh * B_hh - 2 * tau_h * EE_hh
+
+    dEI_hh = tau_h * (EE_hh - EI_hh) + alpha_h * SI_hh
+
+    ii_sign = +1.0 if LITERAL_II_HH_SIGN else -1.0
+    dII_hh = 2 * tau_h * EI_hh + ii_sign * 2 * gamma_h * II_hh
+
+    # ---- Human-rodent pairs ----
+    dSS_hr = -(alpha_rh + tau_rr) * ((kr - 1) / kr * SS_hr * B_rh_r
+                                     + (kh - 1) / kh * SS_hr * B_rh_h)
+
+    dSI_hr = (alpha_rh + tau_rr) * (kh - 1) / kh * SS_hr * B_rh_h - gamma_r * SI_hr
+
+    # ---- Rodent-rodent pairs ----
+    dSS_rr = -2 * tau_rr * (kr - 1) / kr * SS_rr * B_rr
+
+    dSI_rr = tau_rr * (kr - 1) / kr * SS_rr * B_rr - tau_rr * SI_rr - gamma_r * SI_rr
+
+    dII_rr = 2 * (tau_rr - gamma_r) * SI_rr
+
+    # ---- Singles ----
+    dS_h = -alpha_rh * SI_hr - alpha_h * SI_hh
+    dE_h = alpha_rh * SI_hr + alpha_h * SI_hh - (tau_h + q) * E_h
+    dI_h = tau_h * E_h - gamma_h * I_h
+    dQ_h = q * E_h - gamma_h * Q_h
+    dR_h = gamma_h * (I_h + Q_h)
+
+    dS_r = -tau_rr * SI_rr
+    dI_r = tau_rr * SI_rr - gamma_r * I_r
+    dR_r = gamma_r * I_r
+
+    return [dSS_hh, dSE_hh, dSI_hh, dEE_hh, dEI_hh, dII_hh,
+            dSS_hr, dSI_hr,
+            dSS_rr, dSI_rr, dII_rr,
+            dS_h, dE_h, dI_h, dQ_h, dR_h,
+            dS_r, dI_r, dR_r]
+
+
+def build_initial_pair_state(N_h, N_r, edges_hh, edges_hr, edges_rr,
+                             init_frac_h, init_frac_r):
+    s_h, i_h = 1 - init_frac_h, init_frac_h
+    s_r, i_r = 1 - init_frac_r, init_frac_r
+
+    return [edges_hh * s_h ** 2, 0.0, edges_hh * 2 * s_h * i_h, 0.0, 0.0, edges_hh * i_h ** 2,
+            edges_hr * s_h * s_r, edges_hr * s_h * i_r,
+            edges_rr * s_r ** 2, edges_rr * 2 * s_r * i_r, edges_rr * i_r ** 2,
+            N_h * s_h, 0.0, N_h * i_h, 0.0, 0.0,
+            N_r * s_r, N_r * i_r, 0.0]
+
+
+# ===================================================================
+# 4a. GOODNESS-OF-FIT METRICS  (NEW)
+# ===================================================================
+
+def compute_metrics(sim, model):
+    """RMSE and companion error statistics of a model trajectory against a
+    reference (stochastic-mean) trajectory sampled on the same time grid."""
+    sim = np.asarray(sim, dtype=float)
+    model = np.asarray(model, dtype=float)
+    err = model - sim
+
+    rmse = float(np.sqrt(np.mean(err ** 2)))
+    mae = float(np.mean(np.abs(err)))
+    bias = float(np.mean(err))                     # +ve => model over-predicts
+    max_err = float(np.max(np.abs(err)))
+
+    mean_sim = float(np.mean(sim))
+    rng_sim = float(np.max(sim) - np.min(sim))
+
+    nrmse_mean = 100.0 * rmse / mean_sim if mean_sim > 1e-12 else np.nan
+    nrmse_range = 100.0 * rmse / rng_sim if rng_sim > 1e-12 else np.nan
+
+    ss_res = float(np.sum(err ** 2))
+    ss_tot = float(np.sum((sim - mean_sim) ** 2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else np.nan
+
+    return {'RMSE': rmse, 'NRMSE_mean': nrmse_mean, 'NRMSE_range': nrmse_range,
+            'MAE': mae, 'Bias': bias, 'MaxErr': max_err, 'R2': r2}
+
+
+def peak_metrics(time_grid, sim, model):
+    """Peak-height and peak-timing errors."""
+    sim = np.asarray(sim, dtype=float)
+    model = np.asarray(model, dtype=float)
+    i_s, i_m = int(np.argmax(sim)), int(np.argmax(model))
+    return {'peak_sim': float(sim[i_s]), 'peak_model': float(model[i_m]),
+            'peak_err': float(model[i_m] - sim[i_s]),
+            'peak_pct_err': 100.0 * (model[i_m] - sim[i_s]) / sim[i_s] if sim[i_s] > 1e-12 else np.nan,
+            't_peak_sim': float(time_grid[i_s]), 't_peak_model': float(time_grid[i_m]),
+            't_peak_err': float(time_grid[i_m] - time_grid[i_s])}
+
+
+def rmse_vs_replicates(replicates, model):
+    """RMSE of one model trajectory against EVERY stochastic replicate.
+    Returns (mean, sd) -- shows whether the model sits inside the cloud of
+    individual realisations, not just close to their mean."""
+    model = np.asarray(model, dtype=float)
+    vals = [float(np.sqrt(np.mean((model - np.asarray(rep, dtype=float)) ** 2)))
+            for rep in replicates]
+    return float(np.mean(vals)), float(np.std(vals))
+
+
+def print_rmse_tables(time_grid, series_dict, replicate_dict=None):
+    """series_dict: {label: (sim_mean, pairwise, meanfield)}"""
+    n = len(time_grid)
+    line = "=" * 104
+
+    print("\n" + line)
+    print(f" TABLE 1 -- RMSE OF ODE MODELS vs STOCHASTIC SIMULATION MEAN "
+          f"(n = {n} time points, t in [0, {time_grid[-1]:.2f}])")
+    print(line)
+    header = (f"{'Compartment':<14}{'Model':<22}"
+              f"{'RMSE':>10}{'NRMSE%(mean)':>14}{'NRMSE%(range)':>15}"
+              f"{'MAE':>10}{'Bias':>10}{'R^2':>9}")
+    print(header)
+    print("-" * 104)
+
+    summary = {}
+    for label, (sim, pw, mf) in series_dict.items():
+        m_pw = compute_metrics(sim, pw)
+        m_mf = compute_metrics(sim, mf)
+        summary[label] = (m_pw, m_mf)
+        for name, m in (("Pairwise clustered", m_pw), ("Mean-field", m_mf)):
+            print(f"{label if name.startswith('Pairwise') else '':<14}{name:<22}"
+                  f"{m['RMSE']:>10.3f}{m['NRMSE_mean']:>14.2f}{m['NRMSE_range']:>15.2f}"
+                  f"{m['MAE']:>10.3f}{m['Bias']:>10.3f}{m['R2']:>9.4f}")
+        better = "Pairwise" if m_pw['RMSE'] < m_mf['RMSE'] else "Mean-field"
+        impr = 100.0 * (m_mf['RMSE'] - m_pw['RMSE']) / m_mf['RMSE'] if m_mf['RMSE'] > 0 else np.nan
+        print(f"{'':<14}{'--> lower RMSE:':<22}{better:>10}"
+              f"   (pairwise RMSE is {impr:+.1f}% relative to mean-field)")
+        print("-" * 104)
+
+    # ---- Table 2: peak height / timing ----
+    print("\n" + line)
+    print(" TABLE 2 -- PEAK HEIGHT AND PEAK TIMING ERRORS")
+    print(line)
+    print(f"{'Compartment':<14}{'Model':<22}{'Peak(sim)':>12}{'Peak(model)':>13}"
+          f"{'PeakErr':>10}{'PeakErr%':>11}{'t_peak(sim)':>13}{'t_peak(mod)':>13}")
+    print("-" * 104)
+    for label, (sim, pw, mf) in series_dict.items():
+        for name, mod in (("Pairwise clustered", pw), ("Mean-field", mf)):
+            p = peak_metrics(time_grid, sim, mod)
+            print(f"{label if name.startswith('Pairwise') else '':<14}{name:<22}"
+                  f"{p['peak_sim']:>12.2f}{p['peak_model']:>13.2f}"
+                  f"{p['peak_err']:>10.2f}{p['peak_pct_err']:>11.2f}"
+                  f"{p['t_peak_sim']:>13.3f}{p['t_peak_model']:>13.3f}")
+        print("-" * 104)
+
+    # ---- Table 3: RMSE against individual replicates ----
+    if replicate_dict is not None:
+        print("\n" + line)
+        print(" TABLE 3 -- RMSE AGAINST INDIVIDUAL STOCHASTIC REPLICATES (mean +/- sd over runs)")
+        print(line)
+        print(f"{'Compartment':<14}{'Pairwise clustered':>28}{'Mean-field':>28}"
+              f"{'Sim-mean vs replicates':>30}")
+        print("-" * 104)
+        for label, (sim, pw, mf) in series_dict.items():
+            reps = replicate_dict.get(label)
+            if reps is None:
+                continue
+            a_m, a_s = rmse_vs_replicates(reps, pw)
+            b_m, b_s = rmse_vs_replicates(reps, mf)
+            c_m, c_s = rmse_vs_replicates(reps, sim)   # intrinsic stochastic spread
+            print(f"{label:<14}{a_m:>18.3f} +/-{a_s:>7.3f}"
+                  f"{b_m:>18.3f} +/-{b_s:>7.3f}{c_m:>20.3f} +/-{c_s:>7.3f}")
+        print("-" * 104)
+        print(" (The last column is the irreducible error floor: the RMSE of the")
+        print("  simulation mean itself against individual runs.)")
+
+    # ---- Overall verdict ----
+    tot_pw = sum(m_pw['RMSE'] for m_pw, _ in summary.values())
+    tot_mf = sum(m_mf['RMSE'] for _, m_mf in summary.values())
+    wins_pw = sum(1 for m_pw, m_mf in summary.values() if m_pw['RMSE'] < m_mf['RMSE'])
+    print("\n" + line)
+    print(" OVERALL")
+    print(line)
+    print(f"  Summed RMSE across compartments : pairwise = {tot_pw:.3f}   mean-field = {tot_mf:.3f}")
+    print(f"  Compartments where pairwise wins: {wins_pw} / {len(summary)}")
+    print(f"  Best overall model              : "
+          f"{'Pairwise clustered ODE' if tot_pw < tot_mf else 'Mean-field ODE'}")
+    print(line + "\n")
+
+    return summary
+
+
+# ===================================================================
+# 4b. RUN SIMULATIONS AND PLOT
+# ===================================================================
+
+def run_and_plot(N_h=500, N_r=500,
+                 d_h=3, d_r=3,
+                 alpha_rh=0.1, alpha_h=0.05, tau_h=0.2, q=0.1, gamma_h=0.1,
+                 tau_rr=0.15, gamma_r=0.1,
+                 init_frac_h=0.01, init_frac_r=0.02, t_max=100,
+                 num_sims=20,
+                 phi=0.0, delta_hh=1.0, delta_rh=1.0, delta_rr=1.0):
+
+    adj, species, N_h_actual, N_r_actual = generate_mixed_network(
+        N_h, N_r, d_h, d_h, 1.0, d_r, d_r, 1.0, p_hh=0.5, p_hr=0.5, p_rr=0.5)
+
+    edges_hh, edges_hr, edges_rr, kh, kr = network_edge_summary(
+        adj, species, N_h_actual, N_r_actual)
+
+    print(f"Network generated: {len(species)} nodes, {sum(len(a) for a in adj)//2} edges")
+    print(f"  edges_hh={edges_hh}, edges_hr={edges_hr}, edges_rr={edges_rr}")
+    print(f"  avg human degree kh={kh:.3f}, avg rodent degree kr={kr:.3f}")
+
+    print("Running stochastic simulations...")
+    histories = []
+    for i in range(num_sims):
+        if i % 5 == 0:
+            print(f"  Simulation {i+1}/{num_sims}")
+        histories.append(simulate_two_species(
+            adj, species, N_h_actual, N_r_actual,
+            alpha_rh, alpha_h, tau_h, q, gamma_h, tau_rr, gamma_r,
+            init_frac_h, init_frac_r, t_max))
+
+    print("Interpolating results...")
+    max_time = min(h[-1][0] for h in histories if len(h) > 0)
+    time_grid = np.linspace(0, max_time, 200)
+
+    I_h_interp, I_r_interp, E_h_interp = [], [], []
+    Q_h_interp, R_h_interp, R_r_interp = [], [], []
+
+    for hist in histories:
+        if len(hist) == 0:
+            continue
+        times = np.array([h[0] for h in hist])
+        I_h_interp.append(np.interp(time_grid, times, [h[1] for h in hist]))
+        E_h_interp.append(np.interp(time_grid, times, [h[2] for h in hist]))
+        Q_h_interp.append(np.interp(time_grid, times, [h[3] for h in hist]))
+        R_h_interp.append(np.interp(time_grid, times, [h[4] for h in hist]))
+        I_r_interp.append(np.interp(time_grid, times, [h[5] for h in hist]))
+        R_r_interp.append(np.interp(time_grid, times, [h[6] for h in hist]))
+
+    I_h_mean, I_h_std = np.mean(I_h_interp, axis=0), np.std(I_h_interp, axis=0)
+    I_r_mean, I_r_std = np.mean(I_r_interp, axis=0), np.std(I_r_interp, axis=0)
+    E_h_mean = np.mean(E_h_interp, axis=0)
+    Q_h_mean = np.mean(Q_h_interp, axis=0)
+    R_h_mean = np.mean(R_h_interp, axis=0)
+    R_r_mean = np.mean(R_r_interp, axis=0)
+
+    print("Solving mean-field (singles) ODE...")
+    y0_mf = [N_h_actual * (1 - init_frac_h), 0.0, N_h_actual * init_frac_h, 0.0, 0.0,
+             N_r_actual * (1 - init_frac_r), N_r_actual * init_frac_r, 0.0]
+    params_mf = (N_h_actual, N_r_actual, kh, kr,
+                 alpha_rh, alpha_h, tau_h, q, gamma_h, tau_rr, gamma_r,
+                 delta_hh, delta_rh)
+    mf_sol = odeint(mean_field_singles_odes, y0_mf, time_grid, args=(params_mf,))
+    E_h_mf, I_h_mf, Q_h_mf, R_h_mf = mf_sol[:, 1], mf_sol[:, 2], mf_sol[:, 3], mf_sol[:, 4]
+    I_r_mf, R_r_mf = mf_sol[:, 6], mf_sol[:, 7]
+
+    print("Solving pairwise clustered-approximation ODE...")
+    y0 = build_initial_pair_state(N_h_actual, N_r_actual,
+                                  edges_hh, edges_hr, edges_rr,
+                                  init_frac_h, init_frac_r)
+    params = (N_h_actual, N_r_actual, kh, kr,
+              alpha_rh, alpha_h, tau_h, q, gamma_h, tau_rr, gamma_r,
+              phi, delta_hh, delta_rh, delta_rr)
+    ode_sol = odeint(pairwise_clustered_odes, y0, time_grid, args=(params,))
+
+    E_h_ode, I_h_ode, Q_h_ode, R_h_ode = ode_sol[:, 12], ode_sol[:, 13], ode_sol[:, 14], ode_sol[:, 15]
+    I_r_ode, R_r_ode = ode_sol[:, 17], ode_sol[:, 18]
+
+    # ---------------- RMSE / goodness-of-fit ----------------
+    series_dict = {
+        'I_h':      (I_h_mean, I_h_ode, I_h_mf),
+        'E_h':      (E_h_mean, E_h_ode, E_h_mf),
+        'Q_h':      (Q_h_mean, Q_h_ode, Q_h_mf),
+        'R_h':      (R_h_mean, R_h_ode, R_h_mf),
+        'I_r':      (I_r_mean, I_r_ode, I_r_mf),
+        'R_r':      (R_r_mean, R_r_ode, R_r_mf),
+        'I_total':  (I_h_mean + I_r_mean, I_h_ode + I_r_ode, I_h_mf + I_r_mf),
+    }
+    replicate_dict = {
+        'I_h': I_h_interp, 'E_h': E_h_interp, 'Q_h': Q_h_interp,
+        'R_h': R_h_interp, 'I_r': I_r_interp, 'R_r': R_r_interp,
+        'I_total': [a + b for a, b in zip(I_h_interp, I_r_interp)],
+    }
+    metrics = print_rmse_tables(time_grid, series_dict, replicate_dict)
+
+    # ---------------- Plots ----------------
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    def annotate(ax, label):
+        m_pw, m_mf = metrics[label]
+        ax.text(0.98, 0.97,
+                f"RMSE  pairwise = {m_pw['RMSE']:.2f}\nRMSE  mean-field = {m_mf['RMSE']:.2f}",
+                transform=ax.transAxes, ha='right', va='top', fontsize=8,
+                bbox=dict(boxstyle='round', fc='white', alpha=0.75))
+
+    ax = axes[0, 0]
+    ax.plot(time_grid, I_h_mean, 'b-', label='Stochastic mean')
+    ax.fill_between(time_grid, I_h_mean - I_h_std, I_h_mean + I_h_std, alpha=0.2, color='b', label='±1 std')
+    ax.plot(time_grid, I_h_ode, 'r--', label='Pairwise clustered ODE')
+    ax.plot(time_grid, I_h_mf, 'k:', label='Mean-field ODE')
+    ax.set_xlabel('Time'); ax.set_ylabel('Infectious Humans')
+    ax.set_title('Human Infectious (I_h)'); ax.legend(); ax.grid(True, alpha=0.3)
+    annotate(ax, 'I_h')
+
+    ax = axes[0, 1]
+    ax.plot(time_grid, E_h_mean, 'g-', label='E_h (stochastic)')
+    ax.plot(time_grid, Q_h_mean, 'm-', label='Q_h (stochastic)')
+    ax.plot(time_grid, E_h_ode, 'g--', label='E_h (pairwise ODE)')
+    ax.plot(time_grid, Q_h_ode, 'm--', label='Q_h (pairwise ODE)')
+    ax.plot(time_grid, E_h_mf, 'g:', label='E_h (mean-field ODE)')
+    ax.plot(time_grid, Q_h_mf, 'm:', label='Q_h (mean-field ODE)')
+    ax.set_xlabel('Time'); ax.set_ylabel('Count')
+    ax.set_title('Human Exposed (E_h) and Quarantined (Q_h)')
+    ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+    annotate(ax, 'E_h')
+
+    ax = axes[1, 0]
+    ax.plot(time_grid, I_r_mean, 'b-', label='Stochastic mean')
+    ax.fill_between(time_grid, I_r_mean - I_r_std, I_r_mean + I_r_std, alpha=0.2, color='b', label='±1 std')
+    ax.plot(time_grid, I_r_ode, 'r--', label='Pairwise clustered ODE')
+    ax.plot(time_grid, I_r_mf, 'k:', label='Mean-field ODE')
+    ax.set_xlabel('Time'); ax.set_ylabel('Infectious Rodents')
+    ax.set_title('Rodent Infectious (I_r)'); ax.legend(); ax.grid(True, alpha=0.3)
+    annotate(ax, 'I_r')
+
+    ax = axes[1, 1]
+    I_total_mean = I_h_mean + I_r_mean
+    I_total_std = np.std(np.array(I_h_interp) + np.array(I_r_interp), axis=0)
+    ax.plot(time_grid, I_total_mean, 'b-', label='Stochastic mean')
+    ax.fill_between(time_grid, I_total_mean - I_total_std, I_total_mean + I_total_std,
+                    alpha=0.2, color='b', label='±1 std')
+    ax.plot(time_grid, I_h_ode + I_r_ode, 'r--', label='Pairwise clustered ODE')
+    ax.plot(time_grid, I_h_mf + I_r_mf, 'k:', label='Mean-field ODE')
+    ax.set_xlabel('Time'); ax.set_ylabel('Total Infected')
+    ax.set_title('Total Infected (I_h + I_r)'); ax.legend(); ax.grid(True, alpha=0.3)
+    annotate(ax, 'I_total')
+
+    plt.tight_layout()
+    plt.savefig('two_species_epidemic_comparison.png', dpi=150)
+
+    # ---------------- RMSE bar chart ----------------
+    labels = list(series_dict.keys())
+    rmse_pw = [metrics[l][0]['RMSE'] for l in labels]
+    rmse_mf = [metrics[l][1]['RMSE'] for l in labels]
+    xpos = np.arange(len(labels))
+    w = 0.38
+
+    fig2, ax2 = plt.subplots(figsize=(9, 5))
+    ax2.bar(xpos - w / 2, rmse_pw, w, label='Pairwise clustered ODE', color='firebrick')
+    ax2.bar(xpos + w / 2, rmse_mf, w, label='Mean-field ODE', color='dimgray')
+    ax2.set_xticks(xpos); ax2.set_xticklabels(labels)
+    ax2.set_ylabel('RMSE vs stochastic mean')
+    ax2.set_title('Model accuracy by compartment (lower is better)')
+    ax2.legend(); ax2.grid(True, axis='y', alpha=0.3)
+    for x, v in zip(xpos - w / 2, rmse_pw):
+        ax2.text(x, v, f"{v:.1f}", ha='center', va='bottom', fontsize=8)
+    for x, v in zip(xpos + w / 2, rmse_mf):
+        ax2.text(x, v, f"{v:.1f}", ha='center', va='bottom', fontsize=8)
+    plt.tight_layout()
+    plt.savefig('rmse_comparison.png', dpi=150)
+    plt.show()
+
+    return histories, time_grid, metrics
+
+
+# ===================================================================
+# 5. RUN THE COMPLETE ANALYSIS
+# ===================================================================
+
+if __name__ == "__main__":
+    random.seed(42)
+    np.random.seed(42)
+
+    N_h, N_r = 1000, 400
+    d_h, d_r = 6, 10
+
+    alpha_rh = 1.0
+    alpha_h = 1.0
+    tau_h = 1.0
+    q = 0.5
+    gamma_h = 0.7
+    tau_rr = 1.0
+    gamma_r = 0.7
+
+    init_frac_h, init_frac_r = 0.01, 0.02
+    t_max, num_sims = 100, 50
+
+    phi = 0.6
+    delta_hh = 0.7
+    delta_rh = 0.3
+    delta_rr = 1.0
+
+    print("=" * 60)
+    print("TWO-SPECIES EPIDEMIC SIMULATION (pairwise clustered approximation)")
+    print("=" * 60)
+    print(f"Humans: {N_h}, Rodents: {N_r}")
+    print(f"Average degrees: d_h={d_h}, d_r={d_r}")
+    print(f"Rates: alpha_rh={alpha_rh}, alpha_h={alpha_h}, tau_h={tau_h}, q={q}, gamma_h={gamma_h}")
+    print(f"Rodent rates: tau_rr={tau_rr}, gamma_r={gamma_r}")
+    print(f"Number of simulations: {num_sims}")
+    print("=" * 60)
+
+    histories, time_grid, metrics = run_and_plot(
+        N_h, N_r, d_h, d_r,
+        alpha_rh, alpha_h, tau_h, q, gamma_h,
+        tau_rr, gamma_r,
+        init_frac_h, init_frac_r, t_max,
+        num_sims,
+        phi=phi, delta_hh=delta_hh, delta_rh=delta_rh, delta_rr=delta_rr)
+
+    print("Done! Plots saved as 'two_species_epidemic_comparison.png' "
+          "and 'rmse_comparison.png'")
